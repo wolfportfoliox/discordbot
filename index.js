@@ -18,6 +18,15 @@ const client = new Client({
   ],
 });
 
+// Prevent unhandled errors from crashing the bot
+client.on('error', (error) => {
+  console.error('Discord client error:', error.message);
+});
+
+process.on('unhandledRejection', (error) => {
+  console.error('Unhandled promise rejection:', error?.message || error);
+});
+
 client.commands = new Collection();
 client.cooldowns = new Collection();
 
@@ -29,7 +38,7 @@ if (fs.existsSync(commandsPath)) {
     const filePath = path.join(commandsPath, file);
     const command = await import(`file://${filePath}`);
     client.commands.set(command.default.data.name, command.default);
-    console.log(`✅ Loaded command: ${command.default.data.name}`);
+    console.log(`Loaded command: ${command.default.data.name}`);
   }
 }
 
@@ -45,7 +54,7 @@ if (fs.existsSync(eventsPath)) {
     } else {
       client.on(event.default.name, (...args) => event.default.execute(...args));
     }
-    console.log(`✅ Loaded event: ${event.default.name}`);
+    console.log(`Loaded event: ${event.default.name}`);
   }
 }
 
