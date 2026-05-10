@@ -27,7 +27,7 @@ export default {
       if (!hasRole) {
         return await interaction.reply({
           content: `You do not have permission to use \`/${interaction.commandName}\`.`,
-          ephemeral: true,
+          flags: 64,
         });
       }
     }
@@ -35,11 +35,16 @@ export default {
     try {
       await command.execute(interaction);
     } catch (error) {
-      console.error(error);
-      if (interaction.replied || interaction.deferred) {
-        await interaction.followUp({ content: 'Error executing command!', ephemeral: true });
-      } else {
-        await interaction.reply({ content: 'Error executing command!', ephemeral: true });
+      console.error(`Error in /${interaction.commandName}:`, error.message);
+      // Safely attempt to inform the user — ignore if interaction already handled (e.g. modal shown)
+      try {
+        if (interaction.replied || interaction.deferred) {
+          await interaction.followUp({ content: 'An error occurred while running this command.', flags: 64 });
+        } else {
+          await interaction.reply({ content: 'An error occurred while running this command.', flags: 64 });
+        }
+      } catch {
+        // Interaction already acknowledged (e.g. modal was shown) — nothing to do
       }
     }
   },
