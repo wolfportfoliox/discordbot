@@ -12,6 +12,32 @@ const seenPerformersFile = path.join(__dirname, '..', 'data', 'seenPerformers.js
 
 const rssParser = new Parser();
 
+// Keywords that qualify a news article for posting
+const NEWS_KEYWORDS = [
+  // Crypto
+  'bitcoin', 'ethereum', 'crypto', 'blockchain', 'defi', 'altcoin', 'nft', 'stablecoin',
+  'binance', 'coinbase', 'solana', 'ripple', 'xrp', 'btc', 'eth', 'token', 'web3',
+  // Stocks & markets
+  'stock', 'nasdaq', 'dow jones', 's&p', 'nyse', 'shares', 'equity', 'ipo', 'earnings',
+  'wall street', 'federal reserve', 'fed rate', 'interest rate', 'bond', 'yield',
+  // Forex & economy
+  'forex', 'currency', 'dollar', 'euro', 'yen', 'pound', 'exchange rate', 'usd', 'eur',
+  'inflation', 'recession', 'gdp', 'economy', 'economic', 'tariff', 'trade war',
+  'central bank', 'imf', 'world bank', 'debt', 'deficit', 'monetary',
+  // War & geopolitics
+  'war', 'conflict', 'military', 'sanctions', 'attack', 'strike', 'ceasefire',
+  'invasion', 'missile', 'nato', 'ukraine', 'russia', 'iran', 'israel', 'china',
+  'geopolit', 'nuclear', 'troops', 'blockade',
+  // Disaster & big impact
+  'earthquake', 'tsunami', 'hurricane', 'flood', 'wildfire', 'disaster', 'pandemic',
+  'outbreak', 'crisis', 'collapse', 'bankruptcy', 'default', 'crash',
+];
+
+function isRelevantArticle(title = '', description = '') {
+  const text = (title + ' ' + description).toLowerCase();
+  return NEWS_KEYWORDS.some(kw => text.includes(kw));
+}
+
 function ensureDataDir() {
   const dataDir = path.join(__dirname, '..', 'data');
   if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
@@ -39,12 +65,6 @@ function saveSeenPerformers(seen) {
   fs.writeFileSync(seenPerformersFile, JSON.stringify(seen.slice(-50), null, 2));
 }
 
-function pad(str, len, right = false) {
-  str = String(str);
-  if (str.length >= len) return str.slice(0, len);
-  return right ? str.padEnd(len) : str.padStart(len);
-}
-
 export function marketScheduler(client) {
   const run = async () => {
     try {
@@ -54,26 +74,24 @@ export function marketScheduler(client) {
       const topCoins = await getTopCoins(7);
       if (!topCoins.length) return;
 
-      const header =
-        `# Apex Market Update\n` +
-        `Check Live Market price coin and also set alert.\n\n`;
-
-      const divider = `${'─'.repeat(58)}\n`;
-      const colHeader = `${'No.'} ${'Coin Name'.padEnd(18)} ${'Price'.padStart(12)} ${'Change'.padStart(9)} ${'MCap'.padStart(9)}\n`;
+      const colHeader = `${'No.'.padEnd(4)} ${'Coin Name'.padEnd(20)} ${'Price'.padStart(13)} ${'Change'.padStart(9)} ${'MCap'.padStart(9)}`;
+      const divider = '─'.repeat(colHeader.length);
 
       const rows = topCoins.map((coin, i) => {
-        const num = `${i + 1}.`.padEnd(3);
-        const name = `${coin.name} (${coin.symbol.toUpperCase()})`.padEnd(18).slice(0, 18);
-        const price = `$${Number(coin.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`.padStart(12);
+        const num = `${i + 1}.`.padEnd(4);
+        const name = `${coin.name} (${coin.symbol.toUpperCase()})`.padEnd(20).slice(0, 20);
+        const price = `$${Number(coin.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`.padStart(13);
         const sign = parseFloat(coin.change24h) >= 0 ? '+' : '';
         const change = `${sign}${coin.change24h}%`.padStart(9);
         const mcap = `$${coin.marketCap}`.padStart(9);
         return `${num} ${name} ${price} ${change} ${mcap}`;
       }).join('\n');
 
-      const footer = `\n\n**Thanks for Visiting the Market Channel, You can more Market Update here!**`;
-
-      const message = header + '```\n' + colHeader + divider + rows + '\n```' + footer;
+      const message =
+        `# Apex Market Update\n` +
+        `Check Live Market price coin and also set alert.\n\n` +
+        `\`\`\`\n${colHeader}\n${divider}\n${rows}\n\`\`\`\n` +
+        `**Thanks for Visiting the Market channel, you can get more Market Updates here!**`;
 
       await channel.send(message);
       console.log('Market update sent');
@@ -96,32 +114,35 @@ export function newsScheduler(client) {
       if (!articles.length) return;
 
       const seen = getSeenNews();
-      const newArticles = articles.filter(a => !seen.includes(a.guid));
-      if (!newArticles.length) { console.log('No new news to post'); return; }
+      const newArticles = articles.filter(a =>
+        !seen.includes(a.guid) && isRelevantArticle(a.title, a.description)
+      );
+
+      if (!newArticles.length) { console.log('No relevant new articles to post'); return; }
 
       const article = newArticles[0];
 
       const embed = new EmbedBuilder()
-        .setColor('#0099ff')
+        .setColor('#e8b400')
         .setTitle(article.title.slice(0, 256))
         .setURL(article.url)
-        .setFooter({ text: article.source })
+        .setAuthor({ name: article.source })
         .setTimestamp(new Date(article.pubDate));
 
-      if (article.description) embed.setDescription(article.description.slice(0, 350));
+      if (article.description) embed.setDescription(article.description.slice(0, 400));
       if (article.image) embed.setImage(article.image);
 
       await channel.send({ embeds: [embed] });
       seen.push(article.guid);
       saveSeenNews(seen);
-      console.log('News article posted');
+      console.log(`News posted: ${article.title.slice(0, 60)}`);
     } catch (error) {
       console.error('Error in news scheduler:', error.message);
     }
   };
 
   run();
-  setInterval(run, 8 * 60 * 1000);
+  setInterval(run, 8 * 60 * 1000); // ~7-8 per hour
 }
 
 export function topPerformerScheduler(client) {
@@ -160,7 +181,7 @@ export function topPerformerScheduler(client) {
   };
 
   run();
-  setInterval(run, 2 * 60 * 60 * 1000); // every 2 hours
+  setInterval(run, 2 * 60 * 60 * 1000);
 }
 
 export function checkPriceAlerts(client) {
@@ -239,29 +260,19 @@ async function getTopCoins(count = 7) {
 async function getTopPerformer() {
   try {
     const response = await axios.get('https://api.coingecko.com/api/v3/coins/markets', {
-      params: {
-        vs_currency: 'usd',
-        order: 'percent_change_24h_desc',
-        per_page: 50,
-        page: 1,
-        sparkline: false,
-      },
+      params: { vs_currency: 'usd', order: 'percent_change_24h_desc', per_page: 50, page: 1, sparkline: false },
       headers: { Accept: 'application/json' },
       timeout: 10000,
     });
-
-    // Filter out stablecoins and very small market caps, pick top gainer
+    const stables = ['tether', 'usd-coin', 'dai', 'binance-usd', 'true-usd', 'first-digital-usd'];
     const candidates = response.data.filter(c =>
       c.market_cap > 500_000_000 &&
       c.price_change_percentage_24h > 5 &&
-      !['tether', 'usd-coin', 'dai', 'binance-usd', 'true-usd'].includes(c.id)
+      !stables.includes(c.id)
     );
-
     if (!candidates.length) return null;
-
     candidates.sort((a, b) => b.price_change_percentage_24h - a.price_change_percentage_24h);
     const coin = candidates[0];
-
     return {
       id: coin.id,
       name: coin.name,
@@ -284,9 +295,7 @@ async function getCurrentPrices(coins) {
       timeout: 10000,
     });
     const result = {};
-    for (const [coin, data] of Object.entries(response.data)) {
-      result[coin] = data.usd;
-    }
+    for (const [coin, data] of Object.entries(response.data)) result[coin] = data.usd;
     return result;
   } catch (error) {
     console.error('Error fetching prices:', error.message);
@@ -295,20 +304,29 @@ async function getCurrentPrices(coins) {
 }
 
 async function getLatestNews() {
+  // Authoritative sources covering crypto, stocks, forex, war, economy, disasters
   const feeds = [
+    { url: 'https://feeds.bbci.co.uk/news/world/rss.xml', source: 'BBC News' },
+    { url: 'https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100727362', source: 'CNBC' },
     { url: 'https://feeds.feedburner.com/CoinDesk', source: 'CoinDesk' },
     { url: 'https://cointelegraph.com/rss', source: 'CoinTelegraph' },
+    { url: 'https://feeds.bbci.co.uk/news/business/rss.xml', source: 'BBC Business' },
+    { url: 'https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664', source: 'CNBC Markets' },
   ];
+
   const articles = [];
+
   for (const feed of feeds) {
     try {
       const parsed = await rssParser.parseURL(feed.url);
-      for (const item of parsed.items.slice(0, 8)) {
+      for (const item of parsed.items.slice(0, 10)) {
         let image = null;
         if (item.enclosure?.url) image = item.enclosure.url;
         else if (item['media:content']?.$.url) image = item['media:content'].$.url;
-        const rawDesc = item.contentSnippet || item.content || item.description || '';
-        const description = rawDesc.replace(/<[^>]*>/g, '').trim().slice(0, 350);
+
+        const rawDesc = item.contentSnippet || item.description || '';
+        const description = rawDesc.replace(/<[^>]*>/g, '').trim().slice(0, 400);
+
         articles.push({
           guid: item.guid || item.link,
           title: item.title?.trim() || 'No title',
@@ -320,9 +338,11 @@ async function getLatestNews() {
         });
       }
     } catch (e) {
-      console.error(`Error fetching ${feed.source} RSS:`, e.message);
+      console.error(`Error fetching ${feed.source}:`, e.message);
     }
   }
+
+  // Newest first
   articles.sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate));
   return articles;
 }
