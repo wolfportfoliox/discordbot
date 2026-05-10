@@ -18,6 +18,7 @@ export default {
     const row = new ActionRowBuilder().addComponents(messageInput);
     modal.addComponents(row);
 
+    // showModal acknowledges the interaction — no reply needed after this
     await interaction.showModal(modal);
   },
 };
