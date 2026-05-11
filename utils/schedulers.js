@@ -246,17 +246,21 @@ export function newsScheduler(client) {
 
     const article = candidates[0];
 
-    const embed = new EmbedBuilder()
-      .setColor('#e8b400')
-      .setTitle(article.title.slice(0, 256))
-      .setURL(article.url)
-      .setAuthor({ name: article.source })
-      .setTimestamp(new Date(article.pubDate));
+    // Format description into ~5 blockquote lines
+    const rawSummary = (article.description ?? '').replace(/\s+/g, ' ').trim();
+    const summary = rawSummary
+      ? wrapIntoLines(rawSummary, 90, 5).map(l => `> ${l}`).join('\n')
+      : '> No summary available.';
 
-    if (article.description) embed.setDescription(article.description.slice(0, 400));
-    if (article.image)       embed.setImage(article.image);
+    const msg =
+      `## Apex News!\n` +
+      `you can get information/news ongoing here.\n\n` +
+      `**${article.title.slice(0, 256)}**\n` +
+      `${summary}\n\n` +
+      `Link: ${article.url}\n\n` +
+      `**Thanks for visiting News Channel.**`;
 
-    await channel.send({ embeds: [embed] });
+    await channel.send(msg);
 
     seen.push(article.guid);
     writeJson(seenNewsFile, seen.slice(-500));
@@ -461,6 +465,29 @@ async function getLatestNews() {
 
   articles.sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate));
   return articles;
+}
+
+// ─── Text helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Wraps a long string into at most `maxLines` lines of at most `maxChars` each.
+ * Breaks on word boundaries.
+ */
+function wrapIntoLines(text, maxChars = 90, maxLines = 5) {
+  const words = text.split(' ');
+  const lines = [];
+  let current = '';
+  for (const word of words) {
+    if (lines.length >= maxLines) break;
+    if ((current + ' ' + word).trim().length > maxChars) {
+      if (current) lines.push(current.trim());
+      current = word;
+    } else {
+      current = (current + ' ' + word).trim();
+    }
+  }
+  if (current && lines.length < maxLines) lines.push(current.trim());
+  return lines;
 }
 
 // ─── Formatting ───────────────────────────────────────────────────────────────
