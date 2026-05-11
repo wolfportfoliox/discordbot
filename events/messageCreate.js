@@ -1,6 +1,6 @@
 import { fetchCoinData, fmtPrice, fmtChange } from '../commands/price.js';
 
-const PREFIX = '!as ';  // case-insensitive match
+const PREFIX = 'p ';  // e.g. P BTC, P solana, P eth
 
 export default {
   name: 'messageCreate',
