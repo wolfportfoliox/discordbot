@@ -1,27 +1,31 @@
 import axios from 'axios';
 import { EmbedBuilder } from 'discord.js';
+import cron from 'node-cron';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import Parser from 'rss-parser';
+import { log } from './logger.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const alertsFile          = path.join(__dirname, '..', 'data', 'marketAlerts.json');
-const seenNewsFile        = path.join(__dirname, '..', 'data', 'seenNews.json');
-const recentPerformers    = path.join(__dirname, '..', 'data', 'recentPerformers.json');
-const bullishVotesFile    = path.join(__dirname, '..', 'data', 'bullishVotes.json');
+const __dirname        = path.dirname(fileURLToPath(import.meta.url));
+const alertsFile       = path.join(__dirname, '..', 'data', 'marketAlerts.json');
+const seenNewsFile     = path.join(__dirname, '..', 'data', 'seenNews.json');
+const recentPerfFile   = path.join(__dirname, '..', 'data', 'recentPerformers.json');
+const bullishVotesFile = path.join(__dirname, '..', 'data', 'bullishVotes.json');
 
 const rssParser = new Parser();
 
-// ─── Intervals ────────────────────────────────────────────────────────────────
-const MARKET_INTERVAL    = Math.floor((60 / 7) * 60 * 1000); // 7x/hour  = ~8m 34s
-const PERFORMER_INTERVAL = 6 * 60 * 1000;                    // 10x/hour = 6 min
-const NEWS_INTERVAL      = Math.floor((60 / 8) * 60 * 1000); // 8x/hour  = ~7m 30s
-const ALERT_CHECK        = 60 * 1000;                         // every 1 min
-const PERFORMER_COOLDOWN = 3 * 60 * 60 * 1000;               // same coin can't repeat for 3h
-const VOTE_TTL           = 24 * 60 * 60 * 1000;              // votes expire after 24h
+// ─── Config ───────────────────────────────────────────────────────────────────
+const PERFORMER_COOLDOWN = 3 * 60 * 60 * 1000;  // same coin blocked for 3h
+const VOTE_TTL           = 24 * 60 * 60 * 1000;  // bullish votes expire after 24h
+const MAX_API_RETRIES    = 4;
+const BASE_RETRY_DELAY   = 3000;                  // 3s → 6s → 12s → 24s
 
-// ─── Keywords for news filtering ──────────────────────────────────────────────
+const STABLECOINS = [
+  'tether','usd-coin','dai','binance-usd','true-usd','first-digital-usd',
+  'usdd','frax','usdc','busd','tusd','pax-dollar','gemini-dollar',
+];
+
 const NEWS_KEYWORDS = [
   'bitcoin','ethereum','crypto','blockchain','defi','altcoin','nft','stablecoin',
   'binance','coinbase','solana','ripple','xrp','btc','eth','token','web3',
@@ -37,13 +41,11 @@ const NEWS_KEYWORDS = [
   'outbreak','crisis','collapse','bankruptcy','default','crash',
 ];
 
-const STABLECOINS = [
-  'tether','usd-coin','dai','binance-usd','true-usd','first-digital-usd',
-  'usdd','frax','usdc','busd','tusd','pax-dollar','gemini-dollar',
-];
-
-// ─── Coin rotation state (in-memory, resets on restart — that's fine) ─────────
+// Coin rotation counter — in-memory, resets on restart (fine, just shifts the window)
 let rotationIndex = 0;
+
+// ─── Run-lock flags — prevents cron overlap if a job takes longer than its interval ──
+const running = { market: false, performer: false, news: false, alerts: false };
 
 // ─── File helpers ─────────────────────────────────────────────────────────────
 function ensureDataDir() {
@@ -59,7 +61,9 @@ function readJson(file, fallback) {
 
 function writeJson(file, data) {
   ensureDataDir();
-  try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); } catch {}
+  try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); } catch (e) {
+    log.error(`writeJson failed for ${path.basename(file)}: ${e.message}`, 'fs');
+  }
 }
 
 function isRelevant(title = '', desc = '') {
@@ -70,60 +74,67 @@ function isRelevant(title = '', desc = '') {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 /**
- * Retry with exponential backoff — retries up to `attempts` times.
- * Waits 3s, 6s, 12s between retries.
+ * Retry with exponential backoff.
+ * Respects HTTP 429 Retry-After header from CoinGecko.
  */
-async function withRetry(fn, attempts = 4, label = '') {
-  for (let i = 0; i < attempts; i++) {
+async function withRetry(fn, label) {
+  for (let i = 0; i < MAX_API_RETRIES; i++) {
     try {
       return await fn();
     } catch (err) {
-      const isLast = i === attempts - 1;
-      const status = err?.response?.status ?? '';
-      console.error(
-        `[${label}] attempt ${i + 1}/${attempts} failed${status ? ` (HTTP ${status})` : ''}: ${err.message}` +
-        (isLast ? ' — giving up this cycle' : ' — retrying...')
+      const isLast = i === MAX_API_RETRIES - 1;
+      const status = err?.response?.status;
+      const retryAfter = status === 429
+        ? (parseInt(err.response.headers?.['retry-after'] ?? '60', 10) * 1000)
+        : BASE_RETRY_DELAY * Math.pow(2, i);
+
+      log.warn(
+        `Attempt ${i + 1}/${MAX_API_RETRIES} failed${status ? ` (HTTP ${status})` : ''}: ${err.message}` +
+        (isLast ? ' — skipping this cycle' : ` — waiting ${retryAfter / 1000}s`),
+        label
       );
-      if (!isLast) await sleep(3000 * Math.pow(2, i));
+      if (!isLast) await sleep(retryAfter);
     }
   }
   return null;
 }
 
 /**
- * Sequential scheduler — each run must fully complete before the next is scheduled.
- * Eliminates overlapping API calls that cause rate-limit failures.
+ * Wraps a scheduler function with a run-lock.
+ * If the previous cron tick is still running, this tick is skipped and logged.
  */
-function scheduleLoop(label, fn, intervalMs) {
-  const loop = async () => {
-    try { await fn(); } catch (e) { console.error(`[${label}] unhandled error:`, e.message); }
-    setTimeout(loop, intervalMs);
+function withLock(key, fn) {
+  return async () => {
+    if (running[key]) {
+      log.warn('Previous run still active — skipping this tick', key);
+      return;
+    }
+    running[key] = true;
+    try { await fn(); }
+    catch (e) { log.error(`Unhandled error in scheduler: ${e.message}`, key); }
+    finally { running[key] = false; }
   };
-  return loop;
 }
 
-// ─── Market scheduler: rotating top 7 ────────────────────────────────────────
+// ─── Public scheduler initializers ───────────────────────────────────────────
+
+/**
+ * Market update: 7x per hour (every 8 minutes via cron).
+ * Shows rotating top 7 from the top 50 coins — always BTC/ETH + 5 rotating.
+ */
 export function marketScheduler(client) {
   const run = async () => {
     const channel = await fetchChannel(client, process.env.MARKET_CHANNEL_ID, 'MARKET_CHANNEL_ID');
     if (!channel) return;
 
-    const pool = await withRetry(() => getTopCoinPool(50), 4, 'market');
-    if (!pool?.length) { console.error('[market] No coin pool returned'); return; }
+    const pool = await withRetry(() => getTopCoinPool(50), 'market');
+    if (!pool?.length) { log.error('No coin pool returned', 'market'); return; }
 
-    // Always include coins[0] (BTC) and coins[1] (ETH) — they're the anchors.
-    // Pick 5 more from the rest of the pool in a rotating fashion so each update
-    // shows different coins from the top 50.
-    const anchors = pool.slice(0, 2);
-    const rest    = pool.slice(2);
-
-    // Rotate in windows of 5 across the remaining pool
+    const anchors  = pool.slice(0, 2);
+    const rest     = pool.slice(2);
     const poolSize = rest.length;
     const start    = (rotationIndex * 5) % poolSize;
-    const rotating = [];
-    for (let i = 0; i < 5; i++) {
-      rotating.push(rest[(start + i) % poolSize]);
-    }
+    const rotating = Array.from({ length: 5 }, (_, i) => rest[(start + i) % poolSize]);
     rotationIndex++;
 
     const coins = [...anchors, ...rotating];
@@ -134,8 +145,7 @@ export function marketScheduler(client) {
       const num    = `${i + 1}.`.padEnd(4);
       const name   = `${c.name} (${c.symbol.toUpperCase()})`.padEnd(18).slice(0, 18);
       const price  = `$${Number(c.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`.padStart(14);
-      const chg    = parseFloat(c.change24h);
-      const sign   = chg >= 0 ? '+' : '';
+      const sign   = parseFloat(c.change24h) >= 0 ? '+' : '';
       const change = `${sign}${c.change24h}%`.padStart(8);
       const mcap   = `$${c.marketCap}`.padStart(9);
       return `${num} ${name} ${price} ${change} ${mcap}`;
@@ -148,42 +158,45 @@ export function marketScheduler(client) {
       `**Use /price <coin> for detailed info · /marketalert to set price alerts**`;
 
     await channel.send(msg);
-    console.log(`[market] Sent rotating top 7 (window offset ${rotationIndex - 1})`);
+    log.sched(`Sent rotating top 7 (window ${rotationIndex - 1})`, 'market');
   };
 
-  scheduleLoop('market', run, MARKET_INTERVAL)();
+  // Cron: every 8 minutes — 7.5x/hour ≈ 7x/hour target
+  cron.schedule('*/8 * * * *', withLock('market', run), { timezone: 'UTC' });
+
+  // Also fire immediately on startup so the channel gets an update right away
+  withLock('market', run)();
+  log.info('Market scheduler started (cron: every 8 min)', 'market');
 }
 
-// ─── Best performer scheduler ─────────────────────────────────────────────────
-// Rules:
-//  - Only coins with 3–14% 24h gain (building momentum, not already peaked)
-//  - Must have positive 1h change (still moving up now)
-//  - Min $200M market cap
-//  - Same coin cannot repost within 3 hours
-//  - User bullish votes boost a coin's priority score
+/**
+ * Best performer spotlight: 10x per hour (every 6 minutes via cron).
+ * Selects coins with genuine building momentum — not already-peaked coins.
+ * Community bullish votes boost coin priority.
+ */
 export function topPerformerScheduler(client) {
   const run = async () => {
     const channel = await fetchChannel(client, process.env.MARKET_CHANNEL_ID, 'MARKET_CHANNEL_ID');
     if (!channel) return;
 
-    const coin = await withRetry(getSmartPerformer, 4, 'performer');
-    if (!coin) { console.error('[performer] No qualifying coin found this cycle'); return; }
+    const coin = await withRetry(getSmartPerformer, 'performer');
+    if (!coin) { log.warn('No qualifying coin found this cycle', 'performer'); return; }
 
-    // Mark as recently posted
-    const recent = readJson(recentPerformers, []);
+    // Track recently posted coins
+    const recent = readJson(recentPerfFile, []);
     recent.push({ id: coin.id, postedAt: Date.now() });
-    writeJson(recentPerformers, recent);
+    writeJson(recentPerfFile, recent);
 
-    const chg24 = parseFloat(coin.change24h);
-    const chg1h = parseFloat(coin.change1h);
-    const sign24 = chg24 >= 0 ? '+' : '';
-    const sign1h = chg1h >= 0 ? '+' : '';
+    const chg24  = parseFloat(coin.change24h);
+    const chg1h  = parseFloat(coin.change1h);
+    const s24    = chg24 >= 0 ? '+' : '';
+    const s1h    = chg1h >= 0 ? '+' : '';
 
-    const trend =
-      coin.userVoted     ? 'Community Bullish Pick' :
-      chg1h >= 2         ? 'Strong Momentum'        :
-      chg1h >= 0.5       ? 'Bullish'                :
-      chg24 >= 8         ? 'Recovering Well'        : 'Building Momentum';
+    const trend  =
+      coin.userVoted ? 'Community Bullish Pick'  :
+      chg1h >= 2     ? 'Strong Momentum'          :
+      chg1h >= 0.5   ? 'Bullish'                  :
+      chg24 >= 8     ? 'Recovering Well'          : 'Building Momentum';
 
     const msg =
       `# Apex Performer Spotlight\n` +
@@ -192,8 +205,8 @@ export function topPerformerScheduler(client) {
       `${'─'.repeat(40)}\n` +
       ` Coin     : ${coin.name} (${coin.symbol.toUpperCase()})\n` +
       ` Price    : $${Number(coin.price).toLocaleString('en-US', { minimumFractionDigits: 2 })}\n` +
-      ` 24h      : ${sign24}${coin.change24h}%\n` +
-      ` 1h       : ${sign1h}${coin.change1h}%\n` +
+      ` 24h      : ${s24}${coin.change24h}%\n` +
+      ` 1h       : ${s1h}${coin.change1h}%\n` +
       ` MCap     : $${coin.marketCap}\n` +
       ` Volume   : $${coin.volume}\n` +
       ` Rank     : #${coin.rank}\n` +
@@ -203,26 +216,33 @@ export function topPerformerScheduler(client) {
       `**DYOR — not financial advice.**`;
 
     await channel.send(msg);
-    console.log(`[performer] Sent: ${coin.name} (${sign24}${coin.change24h}% 24h, ${sign1h}${coin.change1h}% 1h) | voted=${coin.userVoted}`);
+    log.sched(`Sent: ${coin.name} (${s24}${coin.change24h}% 24h, ${s1h}${coin.change1h}% 1h) voted=${coin.userVoted}`, 'performer');
   };
 
-  // Start 90s after bot loads to avoid simultaneous API burst
-  setTimeout(() => scheduleLoop('performer', run, PERFORMER_INTERVAL)(), 90_000);
+  // Cron: every 6 minutes — exactly 10x/hour
+  cron.schedule('*/6 * * * *', withLock('performer', run), { timezone: 'UTC' });
+
+  // Stagger first run by 90s so it doesn't collide with market on startup
+  setTimeout(() => withLock('performer', run)(), 90_000);
+  log.info('Performer scheduler started (cron: every 6 min)', 'performer');
 }
 
-// ─── News scheduler ───────────────────────────────────────────────────────────
+/**
+ * News: ~8x per hour (every 7 minutes via cron).
+ * Fetches 6 RSS feeds in parallel, deduplicates by GUID, keyword-filters.
+ */
 export function newsScheduler(client) {
   const run = async () => {
     const channel = await fetchChannel(client, process.env.NEWS_CHANNEL_ID, 'NEWS_CHANNEL_ID');
     if (!channel) return;
 
-    const articles = await withRetry(getLatestNews, 4, 'news');
-    if (!articles?.length) { console.error('[news] No articles returned'); return; }
+    const articles = await withRetry(getLatestNews, 'news');
+    if (!articles?.length) { log.error('No articles returned from any feed', 'news'); return; }
 
     const seen       = readJson(seenNewsFile, []);
     const candidates = articles.filter(a => !seen.includes(a.guid) && isRelevant(a.title, a.description));
 
-    if (!candidates.length) { console.log('[news] No new relevant articles this cycle'); return; }
+    if (!candidates.length) { log.info('No new relevant articles this cycle', 'news'); return; }
 
     const article = candidates[0];
 
@@ -240,14 +260,20 @@ export function newsScheduler(client) {
 
     seen.push(article.guid);
     writeJson(seenNewsFile, seen.slice(-500));
-    console.log(`[news] Posted: ${article.title.slice(0, 70)}`);
+    log.sched(`Posted: ${article.title.slice(0, 80)}`, 'news');
   };
 
-  // Stagger 30s after bot loads
-  setTimeout(() => scheduleLoop('news', run, NEWS_INTERVAL)(), 30_000);
+  // Cron: every 7 minutes — 8.5x/hour
+  cron.schedule('*/7 * * * *', withLock('news', run), { timezone: 'UTC' });
+
+  // Stagger first run by 30s
+  setTimeout(() => withLock('news', run)(), 30_000);
+  log.info('News scheduler started (cron: every 7 min)', 'news');
 }
 
-// ─── Price alert checker ──────────────────────────────────────────────────────
+/**
+ * Price alert checker: runs every minute.
+ */
 export function checkPriceAlerts(client) {
   const run = async () => {
     ensureDataDir();
@@ -257,7 +283,7 @@ export function checkPriceAlerts(client) {
     if (!alerts.length) return;
 
     const coins  = [...new Set(alerts.map(a => a.coin))];
-    const prices = await withRetry(() => getCurrentPrices(coins), 3, 'alerts') ?? {};
+    const prices = await withRetry(() => getCurrentPrices(coins), 'alerts') ?? {};
 
     const triggered = [];
     const remaining = [];
@@ -283,31 +309,29 @@ export function checkPriceAlerts(client) {
           )
           .setTimestamp();
         await ch.send({ embeds: [embed] });
+        log.info(`Triggered alert for ${alert.coin} (${alert.userId})`, 'alerts');
       } catch (e) {
-        console.error('[alerts] Failed to notify:', e.message);
+        log.error(`Failed to notify alert: ${e.message}`, 'alerts');
       }
     }
 
     if (triggered.length) writeJson(alertsFile, remaining);
   };
 
-  setTimeout(() => {
-    run();
-    setInterval(run, ALERT_CHECK);
-  }, 15_000);
+  // Cron: every minute
+  cron.schedule('* * * * *', withLock('alerts', run), { timezone: 'UTC' });
+  log.info('Price alert checker started (cron: every 1 min)', 'alerts');
 }
 
-// ─── API & data helpers ───────────────────────────────────────────────────────
-
+// ─── Discord channel fetch ────────────────────────────────────────────────────
 async function fetchChannel(client, id, label) {
-  if (!id) { console.error(`[scheduler] ${label} env var not set`); return null; }
+  if (!id) { log.error(`${label} environment variable not set`, 'scheduler'); return null; }
   try { return await client.channels.fetch(id); }
-  catch (e) { console.error(`[scheduler] Cannot fetch ${label} (${id}):`, e.message); return null; }
+  catch (e) { log.error(`Cannot fetch ${label} (${id}): ${e.message}`, 'scheduler'); return null; }
 }
 
-/**
- * Fetch top N coins by market cap for the rotation pool.
- */
+// ─── CoinGecko API calls ──────────────────────────────────────────────────────
+
 async function getTopCoinPool(count = 50) {
   const res = await axios.get('https://api.coingecko.com/api/v3/coins/markets', {
     params: {
@@ -333,13 +357,6 @@ async function getTopCoinPool(count = 50) {
     }));
 }
 
-/**
- * Smart performer selection:
- * - 3–14% 24h gain (momentum building, not already peaked/pumped)
- * - Positive 1h change (actively moving up)
- * - Not repeated within 3 hours
- * - User bullish votes get a priority boost
- */
 async function getSmartPerformer() {
   const res = await axios.get('https://api.coingecko.com/api/v3/coins/markets', {
     params: {
@@ -354,49 +371,42 @@ async function getSmartPerformer() {
     timeout: 14000,
   });
 
-  const now   = Date.now();
-  const recent = readJson(recentPerformers, [])
-    .filter(r => now - r.postedAt < PERFORMER_COOLDOWN);
-  writeJson(recentPerformers, recent);
+  const now      = Date.now();
+  const recent   = readJson(recentPerfFile, []).filter(r => now - r.postedAt < PERFORMER_COOLDOWN);
+  writeJson(recentPerfFile, recent);
   const recentIds = new Set(recent.map(r => r.id));
 
-  // Active user bullish votes (not expired)
-  const votes     = readJson(bullishVotesFile, []).filter(v => now - v.ts < VOTE_TTL);
-  const voteSet   = new Set(votes.map(v => v.coinId));
+  const votes    = readJson(bullishVotesFile, []).filter(v => now - v.ts < VOTE_TTL);
+  const voteSet  = new Set(votes.map(v => v.coinId));
 
   const candidates = res.data.filter(c => {
     const chg24 = c.price_change_percentage_24h ?? 0;
     const chg1h = c.price_change_percentage_1h_in_currency ?? 0;
     return (
-      !STABLECOINS.includes(c.id)          &&  // not a stablecoin
-      c.market_cap > 200_000_000            &&  // min $200M market cap
-      chg24 >= 3 && chg24 <= 14             &&  // building momentum, NOT already peaked
-      chg1h > 0                             &&  // actively moving up right now
-      !recentIds.has(c.id)                      // not posted in last 3 hours
+      !STABLECOINS.includes(c.id) &&
+      c.market_cap > 200_000_000  &&
+      chg24 >= 3 && chg24 <= 14  &&
+      chg1h > 0                   &&
+      !recentIds.has(c.id)
     );
   });
 
   if (!candidates.length) return null;
 
-  // Score: 1h change matters most (current momentum), 24h change secondary, votes boost
   candidates.sort((a, b) => {
-    const scoreA = (a.price_change_percentage_1h_in_currency ?? 0) * 2 +
-                   (a.price_change_percentage_24h ?? 0) +
-                   (voteSet.has(a.id) ? 20 : 0);
-    const scoreB = (b.price_change_percentage_1h_in_currency ?? 0) * 2 +
-                   (b.price_change_percentage_24h ?? 0) +
-                   (voteSet.has(b.id) ? 20 : 0);
-    return scoreB - scoreA;
+    const score = c =>
+      (c.price_change_percentage_1h_in_currency ?? 0) * 2 +
+      (c.price_change_percentage_24h ?? 0) +
+      (voteSet.has(c.id) ? 20 : 0);
+    return score(b) - score(a);
   });
 
   const c = candidates[0];
   return {
-    id: c.id,
-    name: c.name,
-    symbol: c.symbol,
-    price: c.current_price,
-    change24h: c.price_change_percentage_24h?.toFixed(2)                 ?? '0.00',
-    change1h:  c.price_change_percentage_1h_in_currency?.toFixed(2)      ?? '0.00',
+    id: c.id, name: c.name, symbol: c.symbol,
+    price:     c.current_price,
+    change24h: c.price_change_percentage_24h?.toFixed(2) ?? '0.00',
+    change1h:  c.price_change_percentage_1h_in_currency?.toFixed(2) ?? '0.00',
     marketCap: formatCap(c.market_cap),
     volume:    formatVol(c.total_volume),
     rank:      c.market_cap_rank,
@@ -425,18 +435,15 @@ async function getLatestNews() {
   ];
 
   const articles = [];
-
   await Promise.allSettled(feeds.map(async feed => {
     try {
       const parsed = await rssParser.parseURL(feed.url);
       for (const item of parsed.items.slice(0, 10)) {
         let image = null;
-        if (item.enclosure?.url)              image = item.enclosure.url;
+        if (item.enclosure?.url)               image = item.enclosure.url;
         else if (item['media:content']?.$?.url) image = item['media:content'].$.url;
-
-        const rawDesc   = item.contentSnippet || item.description || '';
+        const rawDesc    = item.contentSnippet || item.description || '';
         const description = rawDesc.replace(/<[^>]*>/g, '').trim().slice(0, 400);
-
         articles.push({
           guid: item.guid || item.link,
           title: item.title?.trim() || 'Untitled',
@@ -448,7 +455,7 @@ async function getLatestNews() {
         });
       }
     } catch (e) {
-      console.error(`[news] Feed error (${feed.source}):`, e.message);
+      log.warn(`Feed error (${feed.source}): ${e.message}`, 'news');
     }
   }));
 
