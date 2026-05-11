@@ -1,20 +1,18 @@
 {
   "name": "apex-discord-bot",
-  "version": "1.0.0",
-  "description": "Advanced Discord bot with market alerts, live news, and utility commands",
+  "version": "2.0.0",
+  "description": "Apex Syndicate Discord bot — crypto market updates, news, and alerts",
   "main": "index.js",
   "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "deploy-commands": "node deploy-commands.js"
   },
-  "keywords": [
-    "discord",
-    "bot",
-    "market",
-    "news",
-    "crypto"
-  ],
+  "keywords": ["discord", "bot", "crypto", "market", "news"],
   "author": "wolfportfoliox",
   "license": "MIT",
   "dependencies": {
@@ -22,6 +20,7 @@
     "discord.js": "^14.14.0",
     "dotenv": "^16.3.1",
     "node-cache": "^5.1.2",
+    "node-cron": "^3.0.3",
     "rss-parser": "^3.13.0"
   },
   "devDependencies": {
